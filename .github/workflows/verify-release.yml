@@ -1,0 +1,149 @@
+name: Verify Easy!Appointments Release on GitHub
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify
+        required: false
+        default: v1.6.1
+permissions:
+  contents: read
+concurrency:
+  group: easyappointments-release-verification
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG="$(gh release view --json tagName --jq .tagName)"; fi
+          echo "RELEASE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Download exact Release asset on runner
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ASSET_NAME="community.lazycat.app.easyappointments-${RELEASE_TAG}.lpk"
+          echo "ASSET_NAME=$ASSET_NAME" >> "$GITHUB_ENV"
+          gh release view "$RELEASE_TAG" --json tagName,assets > release-metadata.json
+          gh release download "$RELEASE_TAG" --pattern "$ASSET_NAME" --dir verify-pkg
+
+      - name: Verify package contents
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, tarfile, yaml
+
+          tag = os.environ['RELEASE_TAG']
+          name = os.environ['ASSET_NAME']
+          pkg = __import__('pathlib').Path('verify-pkg') / name
+          assert pkg.is_file(), pkg
+
+          h = hashlib.sha256()
+          with pkg.open('rb') as fh:
+              for chunk in iter(lambda: fh.read(1 << 20), b''):
+                  h.update(chunk)
+
+          with tarfile.open(pkg, 'r:') as package:
+              members = package.getnames()
+              for required in ('manifest.yml', 'package.yml', 'content.tar', 'icon.png'):
+                  assert required in members, (required, members)
+
+              info = yaml.safe_load(package.extractfile('package.yml').read())
+              assert info['package'] == 'community.lazycat.app.easyappointments', info['package']
+              assert info['name'] == 'Easy!Appointments', info['name']
+              assert info['version'] == tag.lstrip('v'), (info['version'], tag)
+              assert info['license'] == 'GPL-3.0', info['license']
+              assert info['min_os_version'] == '1.5.0', info['min_os_version']
+
+              raw = package.extractfile('manifest.yml').read().decode()
+              m = yaml.safe_load(raw)
+              app = m['application']
+              assert app['subdomain'] == 'easyappointments', app['subdomain']
+              # admin, provider and customer accounts of its own: no platform gate
+              assert app.get('public_path') == ['/'], app.get('public_path')
+              ups = app['upstreams']
+              assert any(u['location'] == '/' and 'easyappointments:80' in (u.get('backend') or '')
+                         for u in ups), ups
+
+              svcs = m['services']
+              assert set(svcs) == {'db', 'config-init', 'easyappointments'}, set(svcs)
+
+              svc = svcs['easyappointments']
+              assert 'alextselegidis/easyappointments' in svc['image'], svc['image']
+              assert svc['image'].endswith(':' + tag.lstrip('v')), svc['image']
+              assert 'config-init' in (svc.get('depends_on') or []), svc.get('depends_on')
+              assert 'db' in (svc.get('depends_on') or []), svc.get('depends_on')
+
+              binds = svc['binds']
+              # the app reads DB credentials from this file and never from env
+              assert any(b.endswith(':/var/www/html/config.php') for b in binds), binds
+              assert any(b.endswith(':/var/www/html/storage') for b in binds), binds
+              for b in binds:
+                  assert b.startswith('/lzcapp/var/'), b
+
+              # the config file must be rendered before the web server reads it,
+              # otherwise the installer cannot reach the database
+              init = svcs['config-init']
+              assert any(b.endswith(':/target') for b in init['binds']), init['binds']
+              init_env = ' '.join(str(x) for x in init['environment'])
+              assert 'EA_BASE_URL=https://' in init_env, init_env
+              assert 'EA_DB_HOST=db' in init_env, init_env
+              assert 'EA_DB_PASSWORD=' in init_env, init_env
+
+              db = svcs['db']
+              assert 'mysql:8.0' in db['image'], db['image']
+              db_env = ' '.join(str(x) for x in db['environment'])
+              # upstream's docker docs use a published password; a generated one
+              # is required because the instance is reachable from the internet
+              assert 'MYSQL_PASSWORD=' in db_env, db_env
+              assert 'MYSQL_ROOT_PASSWORD=' in db_env, db_env
+              assert not re.search(r'MYSQL_(ROOT_)?PASSWORD=\s*password', db_env), \
+                  'upstream example password must not be reused'
+              assert 'printf "%x"' in raw, 'database secrets should be hex-encoded'
+              assert any(b.endswith(':/var/lib/mysql') for b in db['binds']), db['binds']
+
+              params = yaml.safe_load(package.extractfile('deploy_params.yml').read())
+              assert params['params'] == [], params
+              refs = set(re.findall(r'\.U\.([A-Za-z0-9_]+)', raw))
+              assert refs == set(), ('unexpected deploy param refs', refs)
+
+              assert 'healthcheck' not in svc, svc
+              assert 'lzc-file-chooser' not in raw
+              assert 'docker.sock' not in raw
+              assert 'privileged' not in raw
+              assert 'usage' in m and str(m['usage']).strip(), 'usage section missing'
+              usage_text = str(m['usage'])
+              assert ('真机验证' in usage_text or '实机验证' in usage_text), 'usage must state no device test'
+              assert '安装向导' in usage_text, 'usage should describe the installer'
+
+              with tarfile.open(fileobj=package.extractfile('content.tar')) as content:
+                  cmembers = content.getnames()
+                  lic = [n for n in cmembers if 'licenses/' in n]
+                  assert lic, cmembers
+                  main_lic = [n for n in lic if n.endswith('/LICENSE')]
+                  target = main_lic[0] if main_lic else lic[0]
+                  license_text = content.extractfile(target).read().decode()
+                  flat = ' '.join(license_text.split())
+                  assert 'GNU GENERAL PUBLIC LICENSE' in flat and 'Version 3' in flat, flat[:150]
+                  # the rendered config template must be packaged too
+                  tpl = [n for n in cmembers if n.endswith('config.php.tpl')]
+                  assert tpl, 'config template missing from the package'
+
+          result = {
+              'verified': True,
+              'tag': tag,
+              'sha256': h.hexdigest(),
+              'size': pkg.stat().st_size,
+              'runtime_tested': False,
+              'note': 'app + mysql; config.php rendered by an init step because the app never reads env',
+          }
+          print(json.dumps(result))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          PY
