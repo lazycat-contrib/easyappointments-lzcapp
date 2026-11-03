@@ -1,0 +1,95 @@
+application:
+  subdomain: easyappointments
+  multi_instance: false
+  # The app has its own admin, provider and customer accounts with a web
+  # installer, so it is exposed directly rather than behind the platform gate.
+  public_path:
+    - /
+  upstreams:
+    - location: /package-licenses/
+      backend: file:///lzcapp/pkg/content/licenses/
+    - location: /
+      backend: http://easyappointments:80/
+
+services:
+  db:
+    image: docker.1ms.run/library/mysql:8.0
+    environment:
+      - MYSQL_DATABASE=easyappointments
+      - MYSQL_USER=easyappointments
+      # Upstream's docker docs ship "password" here; use a generated one instead.
+      - |-
+        MYSQL_PASSWORD={{ printf "%x" (stable_secret "ea_db_password") }}
+      - |-
+        MYSQL_ROOT_PASSWORD={{ printf "%x" (stable_secret "ea_db_root") }}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u root -p"$$MYSQL_ROOT_PASSWORD"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    binds:
+      - /lzcapp/var/mysql:/var/lib/mysql
+
+  # Easy!Appointments reads DB credentials from a PHP file of hardcoded
+  # constants, never from the environment. Render that file before the web
+  # server starts; a missing bind source would otherwise become a directory.
+  config-init:
+    image: docker.1ms.run/library/alpine:3.20
+    entrypoint:
+      - /bin/sh
+      - /lzcapp/pkg/content/init.sh
+    environment:
+      - |-
+        EA_BASE_URL=https://{{ .S.AppDomain }}
+      - EA_DB_HOST=db
+      - EA_DB_NAME=easyappointments
+      - EA_DB_USERNAME=easyappointments
+      - |-
+        EA_DB_PASSWORD={{ printf "%x" (stable_secret "ea_db_password") }}
+    binds:
+      - /lzcapp/var/config:/target
+      - /lzcapp/pkg/content:/lzcapp/pkg/content:ro
+      - /lzcapp/pkg/content:/template:ro
+
+  easyappointments:
+    # upstream: alextselegidis/easyappointments:1.6.1
+    image: docker.1ms.run/alextselegidis/easyappointments:1.6.1
+    depends_on:
+      - db
+      - config-init
+    environment:
+      - TZ=Asia/Shanghai
+    binds:
+      # generated config.php with BASE_URL and DB credentials
+      - /lzcapp/var/config/config.php:/var/www/html/config.php
+      # uploaded provider/customer images and stored language packs
+      - /lzcapp/var/storage:/var/www/html/storage
+
+usage: |
+  Easy!Appointments 是预约排班系统。服务方设好可预约的时段和服务项目，客户从公开页面自助挑时间下单，双方都会收到确认。
+
+  使用方法：
+  1. 打开应用，第一次会进入**安装向导**。
+     填管理员的名字、姓、邮箱、用户名和密码，再填公司名称——**这个账号就是管理员，由你自己设置**。
+  2. 登录后台，在 Services 里建服务项目和时长，在 Providers 里加服务人员并设置各自的可预约时段。
+  3. 把首页链接发给客户，他们自己选服务、选时间、填信息就能下单。
+  4. 在后台 Calendar 里查看和管理所有预约。
+
+  数据与安全：
+  - 数据库存在 /lzcapp/var/mysql，上传的图片存在 /lzcapp/var/storage，卸载会一并删除。
+  - **没有内置默认口令**：管理员在安装向导里自己填。
+  - 数据库密码每个部署随机生成（上游 docker 示例里那个密码是公开的弱口令，本包没有沿用）。
+  - 应用直接对外开放，由 Easy!Appointments 自己的登录页鉴权
+    （管理员、服务人员、客户三种角色各自独立）：
+    自带账号体系的服务再套一层平台鉴权会造成重复登录，所以用 public_path。
+
+  说明：
+  - 双容器：Easy!Appointments + MySQL 8.0。首次启动 MySQL 初始化约需半分钟，
+    之后才能进安装向导。
+  - 界面语言已设为中文。
+  - 未配置邮件，预约确认通知需要你先在后台 Settings → Email 填 SMTP。
+  - 未做真机验证：安装向导、建服务与时段、客户下单以及重启后数据留存
+    均未在设备上实测。
