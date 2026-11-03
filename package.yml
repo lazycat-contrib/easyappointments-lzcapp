@@ -1,6 +1,6 @@
 package: community.lazycat.app.easyappointments
 name: Easy!Appointments
-version: 0.0.0
+version: 1.6.1
 description: "Appointment scheduler: let clients book time slots while providers manage their calendar."
 min_os_version: "1.5.0"
 homepage: https://easyappointments.org/
